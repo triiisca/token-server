@@ -1,7 +1,7 @@
 {
   "name": "token-server",
   "version": "1.0.0",
-  "description": "Token server for Agora.io with WebSocket signaling",
+  "description": "Token server for Agora.io with WebSocket signaling on Render",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -23,7 +23,8 @@
     "video",
     "streaming",
     "websocket",
-    "signaling"
+    "signaling",
+    "render"
   ],
   "author": "triiisca",
   "license": "MIT"
