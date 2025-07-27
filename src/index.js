@@ -1,181 +1,195 @@
-// Server Token per Phonly You su Railway
-require('dotenv').config();
 const express = require('express');
 const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
+const WebSocket = require('ws');
+const http = require('http');
 const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Configurazione Agora
-const AGORA_APP_ID = process.env.AGORA_APP_ID || '5207a70aa7f143cf8836989977da308c';
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || '14f43aa68e7b4162847dda4230d5d4f4';
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
 
 // Middleware
-app.use(cors({
-    origin: ['https://bussolaweb.it', 'http://localhost:3000', 'http://127.0.0.1:3000'],
-    credentials: true
-}));
+app.use(cors());
 app.use(express.json());
 
-// Logging middleware
-app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-    next();
-});
+// Configurazione Agora
+const appId = process.env.AGORA_APP_ID;
+const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+
+// Mappa dei canali attivi per signaling
+const activeChannels = new Map();
 
 // Health check
 app.get('/health', (req, res) => {
     res.json({
-        status: 'Server Railway attivo',
+        status: "Server Railway attivo",
         timestamp: new Date().toISOString(),
-        appId: AGORA_APP_ID,
-        environment: process.env.NODE_ENV || 'development'
+        appId: appId,
+        environment: "production"
     });
 });
 
-// Endpoint principale per token anonimi
-app.post('/api/anonymous-token', async (req, res) => {
+// Genera token per chiamate vocali
+app.post('/api/token', (req, res) => {
+    const { channelName, uid, role } = req.body;
+    
+    if (!channelName) {
+        return res.status(400).json({ error: 'channelName richiesto' });
+    }
+    
+    const userId = uid || 0;
+    const userRole = role === 1 ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+    const expirationTimeInSeconds = 3600; // 1 ora
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+    
     try {
-        const { userId } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({
-                success: false,
-                error: 'userId è richiesto'
-            });
-        }
-
-        console.log(`🔑 Generazione token per utente: ${userId}`);
-
-        // Genera UID unico basato su userId
-        const uid = Math.abs(userId.split('').reduce((a, b) => {
-            a = ((a << 5) - a) + b.charCodeAt(0);
-            return a & a;
-        }, 0)) % 1000000;
-
-        const channelName = 'anonymous-channel';
-        const role = RtcRole.PUBLISHER;
-        const expirationTimeInSeconds = 3600; // 1 ora
-        const currentTimestamp = Math.floor(Date.now() / 1000);
-        const expirationTimestamp = currentTimestamp + expirationTimeInSeconds;
-
-        // Genera token dinamico con i certificati
         const token = RtcTokenBuilder.buildTokenWithUid(
-            AGORA_APP_ID,
-            AGORA_APP_CERTIFICATE,
+            appId,
+            appCertificate,
             channelName,
-            uid,
-            role,
-            expirationTimestamp
+            userId,
+            userRole,
+            privilegeExpiredTs
         );
-
-        console.log(`✅ Token generato per UID: ${uid}, expires: ${new Date(expirationTimestamp * 1000).toISOString()}`);
-
-        res.json({
-            success: true,
-            data: {
-                token: token,
-                appId: AGORA_APP_ID,
-                channelName: channelName,
-                uid: uid,
-                userId: userId,
-                expiresAt: expirationTimestamp,
-                expiresIn: expirationTimeInSeconds,
-                generatedAt: currentTimestamp
-            }
-        });
-
+        
+        res.json({ token });
     } catch (error) {
-        console.error('❌ Errore generazione token:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Errore interno del server',
-            message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-        });
+        res.status(500).json({ error: error.message });
     }
 });
 
-// Endpoint generico per token personalizzati
-app.post('/api/token', async (req, res) => {
+// Genera token anonimo
+app.post('/api/anonymous-token', (req, res) => {
+    const { channelName } = req.body;
+    const defaultChannel = channelName || 'anonymous-channel';
+    
+    const userId = 0;
+    const userRole = RtcRole.PUBLISHER;
+    const expirationTimeInSeconds = 3600;
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+    
     try {
-        const {
-            channelName,
-            uid = 0,
-            role = 'publisher',
-            expirationTimeInSeconds = 3600
-        } = req.body;
-
-        if (!channelName) {
-            return res.status(400).json({
-                success: false,
-                error: 'channelName è richiesto'
-            });
-        }
-
-        const roleType = role === 'audience' ? RtcRole.SUBSCRIBER : RtcRole.PUBLISHER;
-        const currentTimestamp = Math.floor(Date.now() / 1000);
-        const expirationTimestamp = currentTimestamp + expirationTimeInSeconds;
-
         const token = RtcTokenBuilder.buildTokenWithUid(
-            AGORA_APP_ID,
-            AGORA_APP_CERTIFICATE,
-            channelName,
-            uid,
-            roleType,
-            expirationTimestamp
+            appId,
+            appCertificate,
+            defaultChannel,
+            userId,
+            userRole,
+            privilegeExpiredTs
         );
-
-        res.json({
-            success: true,
-            data: {
-                token: token,
-                appId: AGORA_APP_ID,
-                channelName: channelName,
-                uid: uid,
-                role: role,
-                expiresAt: expirationTimestamp,
-                expiresIn: expirationTimeInSeconds
-            }
-        });
-
+        
+        res.json({ token });
     } catch (error) {
-        console.error('❌ Errore generazione token generico:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Errore interno del server'
-        });
+        res.status(500).json({ error: error.message });
     }
 });
 
-// Gestione 404
-app.use((req, res) => {
-    res.status(404).json({
-        error: 'Endpoint non trovato',
-        availableEndpoints: [
-            'GET /health',
-            'POST /api/anonymous-token',
-            'POST /api/token'
-        ]
+// SISTEMA WEBSOCKET PER SIGNALING
+wss.on('connection', (ws) => {
+    console.log('Nuova connessione WebSocket per signaling');
+    
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            handleSignalingMessage(ws, data);
+        } catch (error) {
+            console.error('Errore parsing messaggio WebSocket:', error);
+        }
+    });
+    
+    ws.on('close', () => {
+        console.log('Connessione WebSocket chiusa');
+        removeUserFromChannels(ws);
+    });
+    
+    ws.on('error', (error) => {
+        console.error('Errore WebSocket:', error);
     });
 });
+
+function handleSignalingMessage(ws, data) {
+    console.log('Messaggio signaling ricevuto:', data.type);
+    
+    switch(data.type) {
+        case 'join_channel':
+            joinChannel(ws, data.channel, data.userId);
+            break;
+        case 'extension_request':
+            forwardToChannel(data.channel, data, ws);
+            break;
+        case 'extension_response':
+            forwardToChannel(data.channel, data, ws);
+            break;
+        case 'user_report':
+            handleUserReport(data);
+            break;
+        default:
+            console.log('Tipo messaggio sconosciuto:', data.type);
+    }
+}
+
+function joinChannel(ws, channelName, userId) {
+    if (!activeChannels.has(channelName)) {
+        activeChannels.set(channelName, new Set());
+    }
+    
+    ws.channelName = channelName;
+    ws.userId = userId;
+    activeChannels.get(channelName).add(ws);
+    
+    console.log(`Utente ${userId} unito al canale ${channelName}`);
+    console.log(`Canale ${channelName} ha ora ${activeChannels.get(channelName).size} utenti`);
+}
+
+function forwardToChannel(channelName, data, senderWs) {
+    const channelUsers = activeChannels.get(channelName);
+    if (channelUsers) {
+        let forwarded = 0;
+        channelUsers.forEach(ws => {
+            if (ws !== senderWs && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(data));
+                forwarded++;
+            }
+        });
+        console.log(`Messaggio ${data.type} inoltrato a ${forwarded} utenti nel canale ${channelName}`);
+    }
+}
+
+function removeUserFromChannels(ws) {
+    if (ws.channelName) {
+        const channelUsers = activeChannels.get(ws.channelName);
+        if (channelUsers) {
+            channelUsers.delete(ws);
+            console.log(`Utente ${ws.userId} rimosso dal canale ${ws.channelName}`);
+            
+            if (channelUsers.size === 0) {
+                activeChannels.delete(ws.channelName);
+                console.log(`Canale ${ws.channelName} eliminato (vuoto)`);
+            }
+        }
+    }
+}
+
+function handleUserReport(data) {
+    // TODO: Implementare sistema di segnalazioni
+    console.log('Segnalazione ricevuta:', data);
+}
 
 // Gestione errori globali
-app.use((error, req, res, next) => {
-    console.error('❌ Errore non gestito:', error);
-    res.status(500).json({
-        error: 'Errore interno del server'
-    });
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
 });
 
-// Avvio server
-app.listen(PORT, () => {
-    console.log(`🚀 Server Phonly You Token avviato sulla porta ${PORT}`);
-    console.log(`📡 Agora App ID: ${AGORA_APP_ID}`);
-    console.log(`🌐 Endpoint disponibili:`);
-    console.log(`   - GET  /health`);
-    console.log(`   - POST /api/anonymous-token`);
-    console.log(`   - POST /api/token`);
-    console.log(`🔧 Ambiente: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`🎯 Railway URL: https://[PROJECT-NAME].up.railway.app`);
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`🚀 Server attivo su porta ${PORT}`);
+    console.log(`📡 WebSocket endpoint: /ws`);
+    console.log(`🔑 Agora App ID: ${appId}`);
 });
