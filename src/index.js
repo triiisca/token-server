@@ -23,10 +23,11 @@ const activeChannels = new Map();
 // Health check
 app.get('/health', (req, res) => {
     res.json({
-        status: "Server Railway attivo",
+        status: "Server Render attivo",
         timestamp: new Date().toISOString(),
         appId: appId,
-        environment: "production"
+        environment: "production",
+        platform: "render"
     });
 });
 
@@ -189,7 +190,8 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`🚀 Server attivo su porta ${PORT}`);
+    console.log(`🚀 Server Render attivo su porta ${PORT}`);
     console.log(`📡 WebSocket endpoint: /ws`);
     console.log(`🔑 Agora App ID: ${appId}`);
+    console.log(`🌐 Platform: Render`);
 });
