@@ -1,433 +1,386 @@
-const express = require('express');
-const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
-const WebSocket = require('ws');
-const http = require('http');
-const cors = require('cors');
-require('dotenv').config();
+// SOSTITUISCI LE FUNZIONI FCM NEL TUO script.js CON QUESTE
 
-// Firebase Admin SDK
-const admin = require('firebase-admin');
-
-// Inizializza Firebase Admin usando le environment variables
-if (!admin.apps.length) {
-    const serviceAccount = {
-        type: "service_account",
-        project_id: process.env.FIREBASE_PROJECT_ID,
-        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-        private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-        client_email: process.env.FIREBASE_CLIENT_EMAIL,
-        client_id: process.env.FIREBASE_CLIENT_ID,
-        auth_uri: "https://accounts.google.com/o/oauth2/auth",
-        token_uri: "https://oauth2.googleapis.com/token",
-        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-        client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
-        universe_domain: "googleapis.com"
-    };
-
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        projectId: process.env.FIREBASE_PROJECT_ID
-    });
-    
-    console.log('✅ Firebase Admin SDK inizializzato');
+// --- RILEVAMENTO BROWSER ---
+function isSafari() {
+    return /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 }
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: '/ws' });
+function isMobile() {
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+}
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// Configurazione Agora
-const appId = process.env.AGORA_APP_ID;
-const appCertificate = process.env.AGORA_APP_CERTIFICATE;
-
-// Mappa dei canali attivi per signaling
-const activeChannels = new Map();
-
-// Health check
-app.get('/health', (req, res) => {
-    res.json({
-        status: "Server Render attivo",
-        timestamp: new Date().toISOString(),
-        appId: appId,
-        environment: "production",
-        platform: "render",
-        fcm: "enabled"
-    });
-});
-
-// Genera token per chiamate vocali
-app.post('/api/token', (req, res) => {
-    const { channelName, uid, role } = req.body;
+// --- FUNZIONI FCM CON FALLBACK SAFARI ---
+async function initializeFCM() {
+    console.log("🔔 Inizializzazione notifiche - Step 1: Rilevamento browser");
+    console.log("📱 User Agent:", navigator.userAgent);
+    console.log("🌐 Browser rilevato:", isSafari() ? 'Safari' : 'Altri');
+    console.log("📱 Mobile:", isMobile());
     
-    if (!channelName) {
-        return res.status(400).json({ error: 'channelName richiesto' });
+    if (isSafari()) {
+        console.log("🍎 Safari rilevato - usando notifiche native");
+        return await initializeSafariNotifications();
+    } else {
+        console.log("🔥 Browser compatibile FCM - usando Firebase");
+        return await initializeFirebaseFCM();
     }
-    
-    const userId = uid || 0;
-    const userRole = role === 1 ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
-    const expirationTimeInSeconds = 3600; // 1 ora
-    const currentTimestamp = Math.floor(Date.now() / 1000);
-    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-    
+}
+
+// Notifiche native per Safari
+async function initializeSafariNotifications() {
     try {
-        const token = RtcTokenBuilder.buildTokenWithUid(
-            appId,
-            appCertificate,
-            channelName,
-            userId,
-            userRole,
-            privilegeExpiredTs
-        );
+        console.log("🍎 Inizializzazione notifiche Safari...");
         
-        res.json({ token });
+        if (!('Notification' in window)) {
+            console.error("❌ Notifiche non supportate su questo browser");
+            showFCMStatus("Notifiche non supportate", "error");
+            return null;
+        }
+        
+        let permission = Notification.permission;
+        console.log("📱 Permesso notifiche:", permission);
+        
+        if (permission === 'default') {
+            console.log("🔔 Richiesta permessi notifiche native...");
+            permission = await Notification.requestPermission();
+            console.log("📱 Nuovo permesso:", permission);
+        }
+        
+        if (permission === 'granted') {
+            console.log("✅ Notifiche Safari abilitate");
+            showFCMStatus("Notifiche Safari attive", "success");
+            
+            // Test notifica
+            setTimeout(() => {
+                sendSafariNotification("🧪 Test Safari", "Notifiche native funzionanti!");
+            }, 2000);
+            
+            return 'safari-native';
+        } else {
+            console.error("❌ Permessi notifiche negati");
+            showFCMStatus("Permessi negati", "error");
+            return null;
+        }
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error("❌ Errore notifiche Safari:", error);
+        showFCMStatus("Safari Error", "error");
+        return null;
     }
-});
+}
 
-// Genera token anonimo
-app.post('/api/anonymous-token', (req, res) => {
-    const { channelName } = req.body;
-    const defaultChannel = channelName || 'anonymous-channel';
+// FCM completo per browser compatibili
+async function initializeFirebaseFCM() {
+    try {
+        console.log("🔔 Inizializzazione FCM - Step 1: Controllo supporto browser");
+        
+        if (!('serviceWorker' in navigator)) {
+            console.error("❌ Service Worker non supportato");
+            showFCMStatus("Service Worker non supportato", "error");
+            return null;
+        }
+        
+        if (!('Notification' in window)) {
+            console.error("❌ Notifiche non supportate");
+            showFCMStatus("Notifiche non supportate", "error");
+            return null;
+        }
+        
+        console.log("✅ Browser supporta FCM");
+        console.log("🔔 Step 2: Registrazione Service Worker");
+        
+        try {
+            const registration = await navigator.serviceWorker.register('/mem/firebase-messaging-sw.js', {
+                scope: '/mem/'
+            });
+            console.log("✅ Service Worker registrato:", registration);
+            await navigator.serviceWorker.ready;
+            console.log("✅ Service Worker pronto");
+        } catch (swError) {
+            console.error("❌ Errore Service Worker:", swError);
+            showFCMStatus("Service Worker fallito", "error");
+            return null;
+        }
+        
+        console.log("🔔 Step 3: Richiesta permessi notifiche");
+        let permission = Notification.permission;
+        if (permission === 'default') {
+            permission = await Notification.requestPermission();
+        }
+        
+        if (permission !== 'granted') {
+            console.error("❌ Permessi FCM negati");
+            showFCMStatus("Permessi negati", "error");
+            return null;
+        }
+        
+        console.log("🔔 Step 4: Richiesta token FCM");
+        try {
+            fcmToken = await getToken(messaging, {
+                vapidKey: VAPID_KEY,
+                serviceWorkerRegistration: await navigator.serviceWorker.ready
+            });
+            
+            if (fcmToken) {
+                console.log("✅ Token FCM ottenuto:", fcmToken.substring(0, 50) + "...");
+                
+                if (currentUser) {
+                    await saveFCMTokenToProfile(fcmToken);
+                }
+                
+                showFCMStatus("FCM Attivo ✅", "success");
+                testFCMConnection(fcmToken);
+                return fcmToken;
+            } else {
+                console.error("❌ Token FCM vuoto");
+                showFCMStatus("Token FCM vuoto", "error");
+                return null;
+            }
+        } catch (tokenError) {
+            console.error("❌ Errore token FCM:", tokenError);
+            showFCMStatus(`FCM Error: ${tokenError.code}`, "error");
+            return null;
+        }
+    } catch (err) {
+        console.error("❌ Errore generale FCM:", err);
+        showFCMStatus("FCM Error generale", "error");
+        return null;
+    }
+}
+
+// Invio notifiche Safari native
+function sendSafariNotification(title, body, options = {}) {
+    if (Notification.permission !== 'granted') {
+        console.log("❌ Permessi notifiche non concessi");
+        return;
+    }
     
-    const userId = 0;
-    const userRole = RtcRole.PUBLISHER;
-    const expirationTimeInSeconds = 3600;
-    const currentTimestamp = Math.floor(Date.now() / 1000);
-    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+    console.log("🍎 Invio notifica Safari:", title);
     
     try {
-        const token = RtcTokenBuilder.buildTokenWithUid(
-            appId,
-            appCertificate,
-            defaultChannel,
-            userId,
-            userRole,
-            privilegeExpiredTs
-        );
+        const notification = new Notification(title, {
+            body: body,
+            icon: '🎧',
+            tag: 'phonly-you-safari',
+            requireInteraction: true,
+            ...options
+        });
         
-        res.json({ token });
+        notification.onclick = () => {
+            window.focus();
+            notification.close();
+        };
+        
+        // Auto-close dopo 10 secondi
+        setTimeout(() => {
+            notification.close();
+        }, 10000);
+        
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error("❌ Errore notifica Safari:", error);
     }
-});
+}
 
-// ENDPOINT FCM NOTIFICHE
-app.post('/api/send-fcm-notification', async (req, res) => {
+// Test connessione FCM (solo per browser non-Safari)
+async function testFCMConnection(token) {
+    if (isSafari()) {
+        console.log("🍎 Skip test FCM server per Safari");
+        return;
+    }
+    
     try {
-        const { targetUserId, title, body, data = {} } = req.body;
+        console.log("🧪 Test FCM server...");
+        const response = await fetch(`${TOKEN_SERVER_URL}/api/test-fcm`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: token })
+        });
         
-        if (!targetUserId || !title || !body) {
-            return res.status(400).json({ 
-                error: 'targetUserId, title e body sono obbligatori' 
-            });
+        if (response.ok) {
+            const result = await response.json();
+            console.log("✅ Test FCM server riuscito:", result);
+            showInAppNotification("✅ FCM Test", "Notifiche FCM funzionanti!", "success");
+        } else {
+            console.error("❌ Test FCM server fallito");
         }
+    } catch (error) {
+        console.error("❌ Errore test FCM:", error);
+    }
+}
 
-        // Trova il token FCM dell'utente target
-        const db = admin.firestore();
-        const userDoc = await db.collection('users').doc(targetUserId).get();
-        
-        if (!userDoc.exists) {
-            return res.status(404).json({ 
-                error: 'Utente non trovato' 
-            });
-        }
-        
-        const userData = userDoc.data();
-        const fcmToken = userData.fcm_token;
-        
-        if (!fcmToken) {
-            return res.status(404).json({ 
-                error: 'Token FCM non trovato per questo utente' 
-            });
-        }
-
-        const message = {
-            token: fcmToken,
-            notification: {
-                title: title,
-                body: body,
-                icon: '🎧'
-            },
-            data: {
-                ...data,
-                timestamp: Date.now().toString()
-            },
-            webpush: {
-                headers: {
-                    'Urgency': 'high'
-                },
-                notification: {
+// Invio notifiche FCM (con fallback Safari)
+async function sendFCMNotification(targetUserId, title, body, data = {}) {
+    console.log("📱 Invio notifica:", title, "- Browser:", isSafari() ? 'Safari' : 'FCM');
+    
+    if (isSafari()) {
+        // Su Safari usa notifiche native immediate
+        sendSafariNotification(title, body);
+        return true;
+    } else {
+        // Su altri browser usa FCM server
+        try {
+            const response = await fetch(`${TOKEN_SERVER_URL}/api/send-fcm-notification`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    targetUserId: targetUserId,
                     title: title,
                     body: body,
-                    icon: '🎧',
-                    badge: '🎧',
-                    requireInteraction: true,
-                    vibrate: [200, 100, 200],
-                    actions: getNotificationActions(data.type)
-                }
-            }
-        };
-
-        const response = await admin.messaging().send(message);
-        console.log('📱 Notifica FCM inviata:', response);
-        
-        res.json({ 
-            success: true, 
-            messageId: response,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('❌ Errore invio notifica FCM:', error);
-        res.status(500).json({ 
-            error: 'Errore interno del server',
-            details: error.message 
-        });
-    }
-});
-
-// Test endpoint per verificare FCM
-app.post('/api/test-fcm', async (req, res) => {
-    try {
-        const { token } = req.body;
-        
-        if (!token) {
-            return res.status(400).json({ error: 'Token FCM richiesto per test' });
-        }
-
-        const message = {
-            token: token,
-            notification: {
-                title: '🧪 Test Phonly You',
-                body: 'Le notifiche FCM funzionano correttamente!',
-                icon: '🎧'
-            },
-            data: {
-                type: 'test',
-                timestamp: Date.now().toString()
-            },
-            webpush: {
-                notification: {
-                    title: '🧪 Test Phonly You',
-                    body: 'Le notifiche FCM funzionano correttamente!',
-                    icon: '🎧',
-                    badge: '🎧',
-                    requireInteraction: true
-                }
-            }
-        };
-
-        const response = await admin.messaging().send(message);
-        console.log('✅ Test FCM inviato:', response);
-        
-        res.json({ 
-            success: true, 
-            messageId: response,
-            message: 'Notifica di test inviata con successo!' 
-        });
-
-    } catch (error) {
-        console.error('❌ Errore test FCM:', error);
-        res.status(500).json({ 
-            error: 'Errore interno del server',
-            details: error.message 
-        });
-    }
-});
-
-// Endpoint per notificare richiesta estensione
-app.post('/api/notify-extension', async (req, res) => {
-    try {
-        const { targetUserId, fromNickname, channelName } = req.body;
-        
-        const result = await sendFCMToUser(targetUserId, {
-            title: '⏰ Richiesta di estensione!',
-            body: `${fromNickname || 'Un utente'} vuole continuare la chiamata`,
-            data: {
-                type: 'extension_request',
-                channel: channelName,
-                from: targetUserId
-            }
-        });
-        
-        if (result.success) {
-            res.json({ success: true, messageId: result.messageId });
-        } else {
-            res.status(500).json({ error: result.error });
-        }
-
-    } catch (error) {
-        console.error('❌ Errore notifica estensione:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Funzione helper per inviare FCM
-async function sendFCMToUser(userId, { title, body, data = {} }) {
-    try {
-        const db = admin.firestore();
-        const userDoc = await db.collection('users').doc(userId).get();
-        
-        if (!userDoc.exists) {
-            return { success: false, error: 'Utente non trovato' };
-        }
-        
-        const userData = userDoc.data();
-        const fcmToken = userData.fcm_token;
-        
-        if (!fcmToken) {
-            return { success: false, error: 'Token FCM non trovato' };
-        }
-
-        const message = {
-            token: fcmToken,
-            notification: { title, body, icon: '🎧' },
-            data: { ...data, timestamp: Date.now().toString() },
-            webpush: {
-                notification: {
-                    title, body, icon: '🎧', badge: '🎧',
-                    requireInteraction: true,
-                    vibrate: [200, 100, 200],
-                    actions: getNotificationActions(data.type)
-                }
-            }
-        };
-
-        const response = await admin.messaging().send(message);
-        return { success: true, messageId: response };
-
-    } catch (error) {
-        return { success: false, error: error.message };
-    }
-}
-
-// Helper per azioni notifiche
-function getNotificationActions(type) {
-    switch (type) {
-        case 'extension_request':
-            return [
-                { action: 'accept_extension', title: '✅ Accetta' },
-                { action: 'deny_extension', title: '❌ Rifiuta' }
-            ];
-        case 'match_found':
-            return [
-                { action: 'join_call', title: '🎧 Unisciti' },
-                { action: 'ignore', title: '🚫 Ignora' }
-            ];
-        default:
-            return [];
-    }
-}
-
-// WEBSOCKET SIGNALING (ESISTENTE)
-wss.on('connection', (ws) => {
-    console.log('Nuova connessione WebSocket per signaling');
-    
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
-            handleSignalingMessage(ws, data);
-        } catch (error) {
-            console.error('Errore parsing messaggio WebSocket:', error);
-        }
-    });
-    
-    ws.on('close', () => {
-        console.log('Connessione WebSocket chiusa');
-        removeUserFromChannels(ws);
-    });
-    
-    ws.on('error', (error) => {
-        console.error('Errore WebSocket:', error);
-    });
-});
-
-function handleSignalingMessage(ws, data) {
-    console.log('Messaggio signaling ricevuto:', data.type);
-    
-    switch(data.type) {
-        case 'join_channel':
-            joinChannel(ws, data.channel, data.userId);
-            break;
-        case 'extension_request':
-            forwardToChannel(data.channel, data, ws);
-            break;
-        case 'extension_response':
-            forwardToChannel(data.channel, data, ws);
-            break;
-        case 'user_report':
-            handleUserReport(data);
-            break;
-        default:
-            console.log('Tipo messaggio sconosciuto:', data.type);
-    }
-}
-
-function joinChannel(ws, channelName, userId) {
-    if (!activeChannels.has(channelName)) {
-        activeChannels.set(channelName, new Set());
-    }
-    
-    ws.channelName = channelName;
-    ws.userId = userId;
-    activeChannels.get(channelName).add(ws);
-    
-    console.log(`Utente ${userId} unito al canale ${channelName}`);
-    console.log(`Canale ${channelName} ha ora ${activeChannels.get(channelName).size} utenti`);
-}
-
-function forwardToChannel(channelName, data, senderWs) {
-    const channelUsers = activeChannels.get(channelName);
-    if (channelUsers) {
-        let forwarded = 0;
-        channelUsers.forEach(ws => {
-            if (ws !== senderWs && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(data));
-                forwarded++;
-            }
-        });
-        console.log(`Messaggio ${data.type} inoltrato a ${forwarded} utenti nel canale ${channelName}`);
-    }
-}
-
-function removeUserFromChannels(ws) {
-    if (ws.channelName) {
-        const channelUsers = activeChannels.get(ws.channelName);
-        if (channelUsers) {
-            channelUsers.delete(ws);
-            console.log(`Utente ${ws.userId} rimosso dal canale ${ws.channelName}`);
+                    data: data
+                })
+            });
             
-            if (channelUsers.size === 0) {
-                activeChannels.delete(ws.channelName);
-                console.log(`Canale ${ws.channelName} eliminato (vuoto)`);
+            if (response.ok) {
+                console.log("📱 Notifica FCM inviata");
+                return true;
+            } else {
+                console.error("❌ Errore FCM server");
+                return false;
             }
+        } catch (error) {
+            console.error("❌ Errore richiesta FCM:", error);
+            return false;
         }
     }
 }
 
-function handleUserReport(data) {
-    console.log('Segnalazione ricevuta:', data);
+// Versione aggiornata showFCMStatus
+function showFCMStatus(message, type = "success") {
+    console.log(`📱 Status: ${message} (${type})`);
+    
+    const existing = document.getElementById('fcmStatus');
+    if (existing) existing.remove();
+    
+    const indicator = document.createElement('div');
+    indicator.id = 'fcmStatus';
+    indicator.className = `fcm-status ${type}`;
+    indicator.innerHTML = `
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span>📱</span>
+            <span>${message}</span>
+            ${type === 'error' ? '<span style="cursor: pointer;" onclick="showFCMDebug()">🔍</span>' : ''}
+        </div>
+    `;
+    indicator.style.cssText = `
+        position: fixed;
+        bottom: 20px;
+        left: 20px;
+        background: ${type === 'error' ? 'rgba(244, 67, 54, 0.9)' : 'rgba(76, 175, 80, 0.9)'};
+        color: white;
+        padding: 12px 16px;
+        border-radius: 8px;
+        font-size: 14px;
+        z-index: 1000;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        max-width: 300px;
+        word-wrap: break-word;
+    `;
+    
+    document.body.appendChild(indicator);
+    
+    setTimeout(() => {
+        if (indicator.parentNode) {
+            indicator.remove();
+        }
+    }, 5000);
 }
 
-// Gestione errori globali
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-});
+// Notifiche in-app (universali)
+function showInAppNotification(title, body, type = "info") {
+    console.log("💬 Notifica in-app:", title);
+    
+    const notification = document.createElement('div');
+    notification.className = `in-app-notification ${type}`;
+    notification.innerHTML = `
+        <div class="notification-content">
+            <strong>${title}</strong>
+            <p>${body}</p>
+        </div>
+        <button class="notification-close">×</button>
+    `;
+    
+    document.body.appendChild(notification);
+    
+    setTimeout(() => {
+        if (notification.parentNode) {
+            notification.remove();
+        }
+    }, 5000);
+    
+    notification.querySelector('.notification-close').onclick = () => {
+        notification.remove();
+    };
+}
 
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
+// Debug FCM
+window.showFCMDebug = function() {
+    const debugInfo = `
+🔍 DEBUG INFO:
+• Browser: ${isSafari() ? 'Safari' : 'Altri'}
+• Mobile: ${isMobile()}
+• URL: ${window.location.href}
+• Service Worker: ${'serviceWorker' in navigator}
+• Notifiche: ${'Notification' in window}
+• Permesso: ${Notification.permission}
+• Token FCM: ${fcmToken ? 'Presente' : 'Assente'}
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Server Render attivo su porta ${PORT}`);
-    console.log(`📡 WebSocket endpoint: /ws`);
-    console.log(`🔑 Agora App ID: ${appId}`);
-    console.log(`📱 FCM enabled: ${admin.apps.length > 0}`);
-    console.log(`🌐 Platform: Render`);
-});
+Safari ha limitazioni con FCM!
+Usa Chrome/Firefox per FCM completo.
+    `;
+    
+    alert(debugInfo);
+    console.log(debugInfo);
+};
+
+// Gestione messaggi FCM in foreground (solo non-Safari)
+if (!isSafari() && typeof messaging !== 'undefined') {
+    onMessage(messaging, (payload) => {
+        console.log("📨 Messaggio FCM ricevuto:", payload);
+        
+        const { title, body } = payload.notification || {};
+        const { type } = payload.data || {};
+        
+        if (title && body) {
+            showInAppNotification(title, body, type);
+            
+            if (document.hidden && Notification.permission === 'granted') {
+                new Notification(title, {
+                    body: body,
+                    icon: '🎧',
+                    tag: 'fcm-notification'
+                });
+            }
+        }
+        
+        handleFCMAction(payload.data);
+    });
+}
+
+// Gestione azioni FCM
+function handleFCMAction(data) {
+    if (!data || !data.type) return;
+    
+    switch (data.type) {
+        case 'extension_request':
+            console.log("📱 Notifica estensione ricevuta");
+            break;
+        case 'match_found':
+            showInAppNotification(
+                "🎧 Nuova conversazione!", 
+                "Clicca 'Trova conversazione' per unirti",
+                "success"
+            );
+            break;
+    }
+}
+
+// Funzione requestNotificationPermission aggiornata
+async function requestNotificationPermission() {
+    console.log("🔔 INIZIO richiesta permessi notifiche...");
+    console.log("🌐 Browser:", isSafari() ? 'Safari' : 'Altri');
+    
+    const result = await initializeFCM();
+    const finalResult = result ? 'granted' : 'denied';
+    
+    console.log("🔔 FINE richiesta permessi. Risultato:", finalResult);
+    return finalResult;
+}
