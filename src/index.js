@@ -5,6 +5,35 @@ const http = require('http');
 const cors = require('cors');
 require('dotenv').config();
 
+// ============================================
+// AGGIUNGI FIREBASE ADMIN SDK
+// ============================================
+const admin = require('firebase-admin');
+
+// Inizializza Firebase Admin usando le environment variables
+if (!admin.apps.length) {
+    const serviceAccount = {
+        type: "service_account",
+        project_id: process.env.FIREBASE_PROJECT_ID,
+        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+        private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+        client_id: process.env.FIREBASE_CLIENT_ID,
+        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+        token_uri: "https://oauth2.googleapis.com/token",
+        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+        client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
+        universe_domain: "googleapis.com"
+    };
+
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        projectId: process.env.FIREBASE_PROJECT_ID
+    });
+    
+    console.log('✅ Firebase Admin SDK inizializzato');
+}
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
@@ -27,7 +56,8 @@ app.get('/health', (req, res) => {
         timestamp: new Date().toISOString(),
         appId: appId,
         environment: "production",
-        platform: "render"
+        platform: "render",
+        fcm: "enabled"
     });
 });
 
@@ -88,7 +118,211 @@ app.post('/api/anonymous-token', (req, res) => {
     }
 });
 
-// SISTEMA WEBSOCKET PER SIGNALING
+// ============================================
+// ENDPOINT FCM NOTIFICHE
+// ============================================
+
+// Invia notifica FCM a un utente specifico
+app.post('/api/send-fcm-notification', async (req, res) => {
+    try {
+        const { targetUserId, title, body, data = {} } = req.body;
+        
+        if (!targetUserId || !title || !body) {
+            return res.status(400).json({ 
+                error: 'targetUserId, title e body sono obbligatori' 
+            });
+        }
+
+        // Trova il token FCM dell'utente target
+        const db = admin.firestore();
+        const userDoc = await db.collection('users').doc(targetUserId).get();
+        
+        if (!userDoc.exists) {
+            return res.status(404).json({ 
+                error: 'Utente non trovato' 
+            });
+        }
+        
+        const userData = userDoc.data();
+        const fcmToken = userData.fcm_token;
+        
+        if (!fcmToken) {
+            return res.status(404).json({ 
+                error: 'Token FCM non trovato per questo utente' 
+            });
+        }
+
+        const message = {
+            token: fcmToken,
+            notification: {
+                title: title,
+                body: body,
+                icon: '🎧'
+            },
+            data: {
+                ...data,
+                timestamp: Date.now().toString()
+            },
+            webpush: {
+                headers: {
+                    'Urgency': 'high'
+                },
+                notification: {
+                    title: title,
+                    body: body,
+                    icon: '🎧',
+                    badge: '🎧',
+                    requireInteraction: true,
+                    vibrate: [200, 100, 200],
+                    actions: getNotificationActions(data.type)
+                }
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log('📱 Notifica FCM inviata:', response);
+        
+        res.json({ 
+            success: true, 
+            messageId: response,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('❌ Errore invio notifica FCM:', error);
+        res.status(500).json({ 
+            error: 'Errore interno del server',
+            details: error.message 
+        });
+    }
+});
+
+// Test endpoint per verificare FCM
+app.post('/api/test-fcm', async (req, res) => {
+    try {
+        const { token } = req.body;
+        
+        if (!token) {
+            return res.status(400).json({ error: 'Token FCM richiesto per test' });
+        }
+
+        const message = {
+            token: token,
+            notification: {
+                title: '🧪 Test Phonly You',
+                body: 'Le notifiche FCM funzionano correttamente!',
+                icon: '🎧'
+            },
+            data: {
+                type: 'test',
+                timestamp: Date.now().toString()
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        res.json({ 
+            success: true, 
+            messageId: response,
+            message: 'Notifica di test inviata con successo!' 
+        });
+
+    } catch (error) {
+        console.error('❌ Errore test FCM:', error);
+        res.status(500).json({ 
+            error: 'Errore interno del server',
+            details: error.message 
+        });
+    }
+});
+
+// Endpoint per notificare richiesta estensione
+app.post('/api/notify-extension', async (req, res) => {
+    try {
+        const { targetUserId, fromNickname, channelName } = req.body;
+        
+        const result = await sendFCMToUser(targetUserId, {
+            title: '⏰ Richiesta di estensione!',
+            body: `${fromNickname || 'Un utente'} vuole continuare la chiamata`,
+            data: {
+                type: 'extension_request',
+                channel: channelName,
+                from: targetUserId
+            }
+        });
+        
+        if (result.success) {
+            res.json({ success: true, messageId: result.messageId });
+        } else {
+            res.status(500).json({ error: result.error });
+        }
+
+    } catch (error) {
+        console.error('❌ Errore notifica estensione:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Funzione helper per inviare FCM
+async function sendFCMToUser(userId, { title, body, data = {} }) {
+    try {
+        const db = admin.firestore();
+        const userDoc = await db.collection('users').doc(userId).get();
+        
+        if (!userDoc.exists) {
+            return { success: false, error: 'Utente non trovato' };
+        }
+        
+        const userData = userDoc.data();
+        const fcmToken = userData.fcm_token;
+        
+        if (!fcmToken) {
+            return { success: false, error: 'Token FCM non trovato' };
+        }
+
+        const message = {
+            token: fcmToken,
+            notification: { title, body, icon: '🎧' },
+            data: { ...data, timestamp: Date.now().toString() },
+            webpush: {
+                notification: {
+                    title, body, icon: '🎧', badge: '🎧',
+                    requireInteraction: true,
+                    vibrate: [200, 100, 200],
+                    actions: getNotificationActions(data.type)
+                }
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        return { success: true, messageId: response };
+
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+}
+
+// Helper per azioni notifiche
+function getNotificationActions(type) {
+    switch (type) {
+        case 'extension_request':
+            return [
+                { action: 'accept_extension', title: '✅ Accetta' },
+                { action: 'deny_extension', title: '❌ Rifiuta' }
+            ];
+        case 'match_found':
+            return [
+                { action: 'join_call', title: '🎧 Unisciti' },
+                { action: 'ignore', title: '🚫 Ignora' }
+            ];
+        default:
+            return [];
+    }
+}
+
+// ============================================
+// WEBSOCKET SIGNALING (ESISTENTE)
+// ============================================
+
 wss.on('connection', (ws) => {
     console.log('Nuova connessione WebSocket per signaling');
     
@@ -175,7 +409,6 @@ function removeUserFromChannels(ws) {
 }
 
 function handleUserReport(data) {
-    // TODO: Implementare sistema di segnalazioni
     console.log('Segnalazione ricevuta:', data);
 }
 
@@ -193,5 +426,6 @@ server.listen(PORT, () => {
     console.log(`🚀 Server Render attivo su porta ${PORT}`);
     console.log(`📡 WebSocket endpoint: /ws`);
     console.log(`🔑 Agora App ID: ${appId}`);
+    console.log(`📱 FCM enabled: ${admin.apps.length > 0}`);
     console.log(`🌐 Platform: Render`);
 });
